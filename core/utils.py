@@ -6,6 +6,8 @@ import torch.nn.functional as F
 
 import roma
 from kiui.op import safe_normalize
+import cv2
+from basicsr.utils import img2tensor
 
 def get_rays(pose, h, w, fovy, opengl=True):
 
@@ -106,4 +108,63 @@ def grid_distortion(images, strength=0.5):
     images = F.grid_sample(images, grids, align_corners=False)
 
     return images
+
+def resize_numpy_image(image, max_resolution=768 * 768, resize_short_edge=None):
+    h, w = image.shape[:2]
+    w_org = image.shape[1]
+    if resize_short_edge is not None:
+        k = resize_short_edge / min(h, w)
+    else:
+        k = max_resolution / (h * w)
+        k = k**0.5
+    h = int(np.round(h * k / 64)) * 64
+    w = int(np.round(w * k / 64)) * 64
+    image = cv2.resize(image, (w, h), interpolation=cv2.INTER_LANCZOS4)
+    scale = w/w_org
+    return image, scale
+
+
+def process_drag(path_mask, h, w, x, y, x_cur, y_cur, scale, input_scale, up_scale, up_ft_index, w_edit, w_inpaint, w_content, precision, latent_in):
+    if isinstance(path_mask, str):
+        mask_x0 = cv2.imread(path_mask)
+    else:
+        mask_x0 = path_mask
+    mask_x0 = cv2.resize(mask_x0, (h, w))
+    mask_x0 = img2tensor(mask_x0)[0]
+    dict_mask = {}
+    dict_mask['base'] = mask_x0
+    mask_x0 = (mask_x0>0.5).float().to('cuda', dtype=precision)
+
+    mask_other = F.interpolate(mask_x0[None,None], (int(mask_x0.shape[-2]//scale), int(mask_x0.shape[-1]//scale)))<0.5
+    mask_tar = []
+    mask_cur = []
+    for p_idx in range(len(x)):
+        mask_tar_i = torch.zeros(int(mask_x0.shape[-2]//scale), int(mask_x0.shape[-1]//scale)).to('cuda', dtype=precision)
+        mask_cur_i = torch.zeros(int(mask_x0.shape[-2]//scale), int(mask_x0.shape[-1]//scale)).to('cuda', dtype=precision)
+        y_tar_clip = int(np.clip(y[p_idx]//scale, 1, mask_tar_i.shape[0]-2))
+        x_tar_clip = int(np.clip(x[p_idx]//scale, 1, mask_tar_i.shape[0]-2))
+        y_cur_clip = int(np.clip(y_cur[p_idx]//scale, 1, mask_cur_i.shape[0]-2))
+        x_cur_clip = int(np.clip(x_cur[p_idx]//scale, 1, mask_cur_i.shape[0]-2))
+        mask_tar_i[y_tar_clip-1:y_tar_clip+2,x_tar_clip-1:x_tar_clip+2]=1
+        mask_cur_i[y_cur_clip-1:y_cur_clip+2,x_cur_clip-1:x_cur_clip+2]=1
+        mask_tar_i = mask_tar_i>0.5
+        mask_cur_i=mask_cur_i>0.5
+        mask_tar.append(mask_tar_i)
+        mask_cur.append(mask_cur_i)
+        latent_in[:,:,y_cur_clip//up_scale-1:y_cur_clip//up_scale+2, x_cur_clip//up_scale-1:x_cur_clip//up_scale+2] = latent_in[:,:, y_tar_clip//up_scale-1:y_tar_clip//up_scale+2, x_tar_clip//up_scale-1:x_tar_clip//up_scale+2] 
+        
+
+    return {
+        "dict_mask":dict_mask,
+        "mask_x0":mask_x0,
+        "mask_tar":mask_tar,
+        "mask_cur":mask_cur,
+        "mask_other":mask_other,
+        "up_scale":up_scale,
+        "up_ft_index":up_ft_index,
+        "w_edit": w_edit,
+        "w_inpaint": w_inpaint,
+        "w_content": w_content,
+        "latent_in":latent_in,
+    }
 

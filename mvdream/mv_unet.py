@@ -1003,3 +1003,74 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
             return self.id_predictor(h)
         else:
             return self.out(h)
+        
+class MyMultiViewUNetModel(MultiViewUNetModel):
+    def forward(
+        self,
+        x,
+        timesteps=None,
+        up_ft_indices=None,
+        context=None,
+        y=None,
+        camera=None,
+        num_frames=1,
+        ip=None,
+        ip_img=None,
+        **kwargs,
+    ):
+        """
+        Apply the model to an input batch.
+        :param x: an [(N x F) x C x ...] Tensor of inputs. F is the number of frames (views).
+        :param timesteps: a 1-D batch of timesteps.
+        :param context: conditioning plugged in via crossattn
+        :param y: an [N] Tensor of labels, if class-conditional.
+        :param num_frames: a integer indicating number of frames for tensor reshaping.
+        :return: an [(N x F) x C x ...] Tensor of outputs. F is the number of frames (views).
+        """
+        assert (
+            x.shape[0] % num_frames == 0
+        ), "input batch size must be dividable by num_frames!"
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
+
+        hs = []
+
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False).to(x.dtype)
+
+        emb = self.time_embed(t_emb)
+
+        if self.num_classes is not None:
+            assert y is not None
+            assert y.shape[0] == x.shape[0]
+            emb = emb + self.label_emb(y)
+
+        # Add camera embeddings
+        if camera is not None:
+            emb = emb + self.camera_embed(camera)
+        
+        # imagedream variant
+        if self.ip_dim > 0:
+            x[(num_frames - 1) :: num_frames, :, :, :] = ip_img # place at [4, 9]
+            ip_emb = self.image_embed(ip)
+            context = torch.cat((context, ip_emb), 1)
+
+        h = x
+        for module in self.input_blocks:
+            h = module(h, emb, context, num_frames=num_frames)
+            hs.append(h)
+        h = self.middle_block(h, emb, context, num_frames=num_frames)
+
+        up_ft = []
+        for i, module in enumerate(self.output_blocks):
+            if i > np.max(up_ft_indices):
+                break
+
+            h = torch.cat([h, hs.pop()], dim=1)
+            h = module(h, emb, context, num_frames=num_frames)
+            if i in up_ft_indices:
+                up_ft.append(h)
+        
+        output = {}
+        output['up_ft'] = up_ft
+        return output

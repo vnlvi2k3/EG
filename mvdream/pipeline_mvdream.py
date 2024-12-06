@@ -14,9 +14,15 @@ from diffusers.utils import (
 from diffusers.configuration_utils import FrozenDict
 from diffusers.schedulers import DDIMScheduler
 from diffusers.utils.torch_utils import randn_tensor
+from sampler import Sampler
+import gc
+import tqdm
+import torch.nn as nn
+from inversion import DDIMInversion
+from PIL import Image
+from attention_processor import Resampler
 
-from mvdream.mv_unet import MultiViewUNetModel, get_camera
-
+from mvdream.mv_unet import MultiViewUNetModel, MyMultiViewUNetModel, get_camera
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -69,6 +75,9 @@ class MVDreamPipeline(DiffusionPipeline):
             new_config["clip_sample"] = False
             scheduler._internal_dict = FrozenDict(new_config)
 
+        estimator = MyMultiViewUNetModel(**unet.config)
+        estimator.load_state_dict(unet.state_dict())
+
         self.register_modules(
             vae=vae,
             unet=unet,
@@ -77,9 +86,11 @@ class MVDreamPipeline(DiffusionPipeline):
             text_encoder=text_encoder,
             feature_extractor=feature_extractor,
             image_encoder=image_encoder,
+            estimator=estimator,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
+        self.device = next(self.unet.parameters()).device
 
     def enable_vae_slicing(self):
         r"""
@@ -427,6 +438,319 @@ class MVDreamPipeline(DiffusionPipeline):
         latents = latents.repeat_interleave(num_images_per_prompt, dim=0)
 
         return torch.zeros_like(latents), latents
+  
+    @torch.no_grad()
+    def image2latent(self, image):
+        with torch.no_grad():
+            latents = self.vae.encode(image)['latent_dist'].mean
+            latents = latents *  self.vae.config.scaling_factor
+        return latents
+    
+    @torch.inference_mode()
+    def get_image_embeds(self, pil_image):
+        dtype = next(self.image_encoder.parameters()).dtype
+        if isinstance(pil_image, Image.Image):
+            pil_image = [pil_image]
+        clip_image = self.feature_extractor(images=pil_image, return_tensors="pt").pixel_values
+        clip_image = clip_image.to('cuda', dtype=dtype)
+        clip_image_embeds = self.image_encoder(clip_image, output_hidden_states=True).hidden_states[-2]
+        image_prompt_embeds = self.image_embed(clip_image_embeds)
+        uncond_clip_image_embeds = self.image_encoder(torch.zeros_like(clip_image), output_hidden_states=True).hidden_states[-2].detach()
+        uncond_image_prompt_embeds = self.image_embed(uncond_clip_image_embeds).detach()
+        return image_prompt_embeds, uncond_image_prompt_embeds
+    
+    def ddim_inv(self, latent, prompt, image=None, guidance_scale=7.0, num_frames=4, elevation=0, num_images_per_prompt=1, negative_prompt=""):
+        do_classifier_free_guidance = guidance_scale > 1.0
+        multiplier = 2 if do_classifier_free_guidance else 1
+
+        actual_num_frames = num_frames if image is None else num_frames + 1
+        if image is not None:
+            camera = get_camera(num_frames, elevation=elevation, extra_view=True).to(dtype=latent.dtype, device=self.device)
+        else:
+            camera = get_camera(num_frames, elevation=elevation, extra_view=False).to(dtype=latent.dtype, device=self.device)
+        camera = camera.repeat_interleave(num_images_per_prompt, dim=0)
+
+        with torch.no_grad():
+            _prompt_embeds = self._encode_prompt(
+                prompt=prompt,
+                device=self.device,
+                num_images_per_prompt=num_images_per_prompt,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                negative_prompt=negative_prompt,
+            )  
+        prompt_embeds_neg, prompt_embeds_pos = _prompt_embeds.chunk(2)
+        prompt_embeds=[prompt_embeds_neg, prompt_embeds_pos]
+
+        image_embeds = None
+        if image is not None:
+            with torch.no_grad():
+                image_embeds_neg, image_embeds_pos = self.encode_image(image, self.device, num_images_per_prompt)
+                image_latents_neg, image_latents_pos = self.encode_image_latents(image, self.device, num_images_per_prompt)
+            ip = torch.cat([image_embeds_neg] * actual_num_frames + [image_embeds_pos] * actual_num_frames)
+            ip_img = torch.cat([image_latents_neg] + [image_latents_pos]) # no repeat
+            image_embeds=[ip, ip_img]
+
+        ddim_inv = DDIMInversion(self.unet, self.tokenizer, self.text_encoder, self.scheduler, guidance_scale, multiplier, actual_num_frames)
+        ddim_latents = ddim_inv.invert(ddim_latents=latent.unsqueeze(2), prompt_embeds=prompt_embeds, image_embeds=image_embeds)
+        return ddim_latents
+    
+    def edit(
+        self,
+        prompt:  List[str],
+        mode,
+        image,
+        edit_kwargs,
+        num_inference_steps: int = 50,
+        elevation: float = 0,
+        guidance_scale: Optional[float] = 7.0,
+        negative_prompt: str = "",
+        num_images_per_prompt: int = 1,
+        latent: Optional[torch.FloatTensor] = None,
+        start_time=50,
+        energy_scale = 0,
+        SDE_strength = 0.4,
+        SDE_strength_un = 0,
+        latent_noise_ref = None,
+        num_frames: int = 4,
+        alg='D+'
+    ):
+        print('Start Editing:')
+        self.alg=alg
+        do_classifier_free_guidance = guidance_scale > 1.0
+        multiplier = 2 if do_classifier_free_guidance else 1
+
+        if image is not None:
+            assert isinstance(image, np.ndarray) and image.dtype == np.float32
+            self.image_encoder = self.image_encoder.to(device=self.device)
+            image_embeds_neg, image_embeds_pos = self.encode_image(image, self.device, num_images_per_prompt)
+            image_latents_neg, image_latents_pos = self.encode_image_latents(image, self.device, num_images_per_prompt)
+        
+        _prompt_embeds = self._encode_prompt(
+            prompt=prompt,
+            device=self.device,
+            num_images_per_prompt=num_images_per_prompt,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            negative_prompt=negative_prompt,
+        )  # type: ignore
+        prompt_embeds_neg, prompt_embeds_pos = _prompt_embeds.chunk(2)
+        actual_num_frames = num_frames if image is None else num_frames + 1
+
+        # generate source text embedding
+        # text_input = self.tokenizer(
+        #     [prompt],
+        #     padding="max_length",
+        #     max_length=self.tokenizer.model_max_length,
+        #     truncation=True,
+        #     return_tensors="pt",
+        # )
+        # text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
+        # max_length = text_input.input_ids.shape[-1]
+        # uncond_input = self.tokenizer(
+        #         [""], padding="max_length", max_length=max_length, return_tensors="pt"
+        #     )
+        # uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
+        # # image prompt
+        # if emb_im is not None and emb_im_uncond is not None:
+        #     uncond_embeddings = torch.cat([uncond_embeddings, emb_im_uncond],dim=1)
+        #     text_embeddings_org = text_embeddings
+        #     text_embeddings = torch.cat([text_embeddings, emb_im],dim=1)
+        #     context = torch.cat([uncond_embeddings.expand(*text_embeddings.shape), text_embeddings])
+
+        self.scheduler.set_timesteps(num_inference_steps) 
+        dict_mask = edit_kwargs['dict_mask'] if 'dict_mask' in edit_kwargs else None
+
+        
+
+        if image is not None:
+            camera = get_camera(num_frames, elevation=elevation, extra_view=True).to(dtype=latent.dtype, device=self.device)
+        else:
+            camera = get_camera(num_frames, elevation=elevation, extra_view=False).to(dtype=latent.dtype, device=self.device)
+            ip = torch.cat([image_embeds_neg] * actual_num_frames + [image_embeds_pos] * actual_num_frames)
+            ip_image = torch.cat([image_latents_neg] + [image_latents_pos])
+        camera = camera.repeat_interleave(num_images_per_prompt, dim=0) 
+        context = torch.cat([prompt_embeds_neg] * actual_num_frames + [prompt_embeds_pos] * actual_num_frames)
+        cam = torch.cat([camera] * multiplier)
+        additional_inputs = {
+            'context': context,
+            'num_frames': actual_num_frames,
+            'camera': cam,
+        }
+        if image is not None:
+            additional_inputs['ip'] = ip
+            additional_inputs['ip_img'] = ip_image
+        for i, t in enumerate(tqdm(self.scheduler.timesteps[-start_time:])):
+            latent_model_input = torch.cat([latent] * multiplier)
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+            next_timestep = min(t - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps, 999)
+            next_timestep = max(next_timestep, 0)
+            if energy_scale==0 or alg=='D':
+                repeat=1
+            elif 20<i<30 and i%2==0 : 
+                repeat = 3
+            else:
+                repeat = 1
+            stack = []
+            for ri in range(repeat):
+                # latent_in = torch.cat([latent.unsqueeze(2)] * 2)
+                tim = torch.tensor([t] * actual_num_frames * multiplier, dtype=latent_model_input.dtype, device=self.device)
+                unet_inputs = {
+                    'x': latent_model_input,
+                    'timesteps': tim,
+                }
+                unet_inputs.update(additional_inputs)
+                with torch.no_grad():
+                    # noise_pred = self.unet(latent_in, t, encoder_hidden_states=context, mask=dict_mask, save_kv=False, mode=mode, iter_cur=i)["sample"].squeeze(2)
+                    noise_pred = self.unet(**unet_inputs)
+                noise_pred_uncond, noise_prediction_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
+
+                if energy_scale!=0 and i<30 and (alg=='D' or i%2==0 or i<10):
+                    # editing guidance
+                    noise_pred_org = noise_pred
+                    if mode == 'drag':
+                        guidance = self.guidance_drag(latent=latent, latent_noise_ref=latent_noise_ref[-(i+1)], t=tim, energy_scale=energy_scale, additional_inputs= additional_inputs, **edit_kwargs)
+                    noise_pred = noise_pred + guidance
+                else:
+                    noise_pred_org=None
+                # zt->zt-1
+                prev_timestep = t - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps
+                alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                alpha_prod_t_prev = self.scheduler.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.scheduler.final_alpha_cumprod
+                beta_prod_t = 1 - alpha_prod_t
+                pred_original_sample = (latent - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
+
+                if 10<i<20:
+                    eta, eta_rd = SDE_strength_un, SDE_strength
+                else:
+                    eta, eta_rd = 0., 0.
+                
+                variance = self.scheduler._get_variance(t, prev_timestep)
+                std_dev_t = eta * variance ** (0.5)
+                std_dev_t_rd = eta_rd * variance ** (0.5)
+                if noise_pred_org is not None:
+                    pred_sample_direction_rd = (1 - alpha_prod_t_prev - std_dev_t_rd**2) ** (0.5) * noise_pred_org
+                    pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * noise_pred_org
+                else:
+                    pred_sample_direction_rd = (1 - alpha_prod_t_prev - std_dev_t_rd**2) ** (0.5) * noise_pred
+                    pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * noise_pred
+
+                latent_prev = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
+                latent_prev_rd = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction_rd
+
+                # Regional SDE
+                if (eta_rd > 0 or eta>0) and alg=='D+':
+                    variance_noise = torch.randn_like(latent_prev)
+                    variance_rd = std_dev_t_rd * variance_noise
+                    variance = std_dev_t * variance_noise
+                    
+                    if mode == 'drag':
+                        mask = F.interpolate(edit_kwargs["mask_x0"][None,None], (latent_prev[-1].shape[-2], latent_prev[-1].shape[-1]))
+                        mask = (mask>0).to(dtype=latent.dtype)
+                if repeat>1:
+                    with torch.no_grad():
+                        alpha_prod_t = self.scheduler.alphas_cumprod[next_timestep]
+                        alpha_prod_t_next = self.scheduler.alphas_cumprod[t]
+                        beta_prod_t = 1 - alpha_prod_t
+
+                        next_tim = torch.tensor([next_timestep] * actual_num_frames * multiplier, dtype=latent_model_input.dtype, device=self.device)
+                        unet_inputs = {
+                            'x': latent_prev,
+                            'timesteps': next_tim,
+                        }
+                        additional_inputs.update(additional_inputs)
+
+                        model_output = self.unet(**unet_inputs)
+                        next_original_sample = (latent_prev - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
+                        next_sample_direction = (1 - alpha_prod_t_next) ** 0.5 * model_output
+                        latent = alpha_prod_t_next ** 0.5 * next_original_sample + next_sample_direction
+            
+            latent = latent_prev
+            
+        return latent
+
+    def guidance_drag(
+        self, 
+        mask_x0,
+        mask_cur, 
+        mask_tar, 
+        mask_other, 
+        latent, 
+        latent_noise_ref, 
+        up_ft_index, 
+        up_scale, 
+        energy_scale,
+        w_edit,
+        w_inpaint,
+        w_content,
+        t,
+        additional_inputs,
+        dict_mask = None,
+    ):
+        cos = nn.CosineSimilarity(dim=1)
+        ref_inputs = {
+            'x': latent_noise_ref,
+            'time_step': t,
+            'up_ft_indices': up_ft_index,
+        }
+        ref_inputs.update(additional_inputs)
+        with torch.no_grad():
+            # up_ft_tar = self.estimator(
+            #             sample=latent_noise_ref.squeeze(2),
+            #             timestep=t,
+            #             up_ft_indices=up_ft_index,
+            #             encoder_hidden_states=text_embeddings)['up_ft']
+            up_ft_tar = self.unet(**ref_inputs)['up_ft']
+            for f_id in range(len(up_ft_tar)):
+                up_ft_tar[f_id] = F.interpolate(up_ft_tar[f_id], (up_ft_tar[-1].shape[-2]*up_scale, up_ft_tar[-1].shape[-1]*up_scale))
+
+        latent = latent.detach().requires_grad_(True)
+        cur_inputs = {
+            'x': latent,
+            'time_step': t,
+            'up_ft_indices': up_ft_index,
+        }
+        cur_inputs.update(additional_inputs)
+        # up_ft_cur = self.estimator(
+        #             sample=latent,
+        #             timestep=t,
+        #             up_ft_indices=up_ft_index,
+        #             encoder_hidden_states=text_embeddings)['up_ft']
+        up_ft_cur = self.unet(**cur_inputs)['up_ft']
+        for f_id in range(len(up_ft_cur)):
+            up_ft_cur[f_id] = F.interpolate(up_ft_cur[f_id], (up_ft_cur[-1].shape[-2]*up_scale, up_ft_cur[-1].shape[-1]*up_scale))
+
+        # moving loss
+        loss_edit = 0
+        for f_id in range(len(up_ft_tar)):
+            for mask_cur_i, mask_tar_i in zip(mask_cur, mask_tar):
+                up_ft_cur_vec = up_ft_cur[f_id][mask_cur_i.repeat(1,up_ft_cur[f_id].shape[1],1,1)].view(up_ft_cur[f_id].shape[1], -1).permute(1,0)
+                up_ft_tar_vec = up_ft_tar[f_id][mask_tar_i.repeat(1,up_ft_tar[f_id].shape[1],1,1)].view(up_ft_tar[f_id].shape[1], -1).permute(1,0)
+                sim = (cos(up_ft_cur_vec, up_ft_tar_vec)+1.)/2.
+                loss_edit = loss_edit + w_edit/(1+4*sim.mean())
+
+                mask_overlap = ((mask_cur_i.float()+mask_tar_i.float())>1.5).float()
+                mask_non_overlap = (mask_tar_i.float()-mask_overlap)>0.5
+                up_ft_cur_non_overlap = up_ft_cur[f_id][mask_non_overlap.repeat(1,up_ft_cur[f_id].shape[1],1,1)].view(up_ft_cur[f_id].shape[1], -1).permute(1,0)
+                up_ft_tar_non_overlap = up_ft_tar[f_id][mask_non_overlap.repeat(1,up_ft_tar[f_id].shape[1],1,1)].view(up_ft_tar[f_id].shape[1], -1).permute(1,0)
+                sim_non_overlap = (cos(up_ft_cur_non_overlap, up_ft_tar_non_overlap)+1.)/2.
+                loss_edit = loss_edit + w_inpaint*sim_non_overlap.mean()
+        # consistency loss
+        loss_con = 0
+        for f_id in range(len(up_ft_tar)):
+            sim_other = (cos(up_ft_tar[f_id], up_ft_cur[f_id])[0][mask_other[0,0]]+1.)/2.
+            loss_con = loss_con+w_content/(1+4*sim_other.mean())
+        loss_edit = loss_edit/len(up_ft_cur)/len(mask_cur)
+        loss_con = loss_con/len(up_ft_cur)
+
+        cond_grad_edit = torch.autograd.grad(loss_edit*energy_scale, latent, retain_graph=True)[0]
+        cond_grad_con = torch.autograd.grad(loss_con*energy_scale, latent)[0]
+        mask = F.interpolate(mask_x0[None,None], (cond_grad_edit[-1].shape[-2], cond_grad_edit[-1].shape[-1]))
+        mask = (mask>0).to(dtype=latent.dtype)
+        guidance = cond_grad_edit.detach()*4e-2*mask + cond_grad_con.detach()*4e-2*(1-mask)
+        self.estimator.zero_grad()
+
+        return guidance
+            
 
     @torch.no_grad()
     def __call__(
