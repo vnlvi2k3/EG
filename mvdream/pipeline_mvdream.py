@@ -14,13 +14,12 @@ from diffusers.utils import (
 from diffusers.configuration_utils import FrozenDict
 from diffusers.schedulers import DDIMScheduler
 from diffusers.utils.torch_utils import randn_tensor
-from sampler import Sampler
 import gc
 import tqdm
 import torch.nn as nn
-from inversion import DDIMInversion
+from mvdream.inversion import DDIMInversion
 from PIL import Image
-from attention_processor import Resampler
+import copy
 
 from mvdream.mv_unet import MultiViewUNetModel, MyMultiViewUNetModel, get_camera
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -75,8 +74,14 @@ class MVDreamPipeline(DiffusionPipeline):
             new_config["clip_sample"] = False
             scheduler._internal_dict = FrozenDict(new_config)
 
-        estimator = MyMultiViewUNetModel(**unet.config)
-        estimator.load_state_dict(unet.state_dict())
+        # init_signature = inspect.signature(unet.__class__.__init__)
+        # params = list(init_signature.parameters.values())[1:]
+        # params = [param for param in params if hasattr(unet, param.name)]
+        # estimator = MyMultiViewUNetModel(**{param.name: getattr(unet, param.name) for param in params})
+        # estimator.load_state_dict(unet.state_dict())
+        estimator = MyMultiViewUNetModel.from_config('pretrained/config.json')
+        estimator.load_state_dict(unet.state_dict(), strict=True)
+
 
         self.register_modules(
             vae=vae,
@@ -90,7 +95,6 @@ class MVDreamPipeline(DiffusionPipeline):
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
-        self.device = next(self.unet.parameters()).device
 
     def enable_vae_slicing(self):
         r"""
@@ -442,6 +446,12 @@ class MVDreamPipeline(DiffusionPipeline):
     @torch.no_grad()
     def image2latent(self, image):
         with torch.no_grad():
+            dtype = next(self.image_encoder.parameters()).dtype
+            # latents = self.vae.encode(image)['latent_dist'].mean
+            # latents = latents *  self.vae.config.scaling_factor
+            image = torch.tensor(image).permute(0, 3, 1, 2).to('cuda') 
+            image = image.to(dtype)
+            image = 2 * image - 1
             latents = self.vae.encode(image)['latent_dist'].mean
             latents = latents *  self.vae.config.scaling_factor
         return latents
@@ -489,9 +499,8 @@ class MVDreamPipeline(DiffusionPipeline):
             ip = torch.cat([image_embeds_neg] * actual_num_frames + [image_embeds_pos] * actual_num_frames)
             ip_img = torch.cat([image_latents_neg] + [image_latents_pos]) # no repeat
             image_embeds=[ip, ip_img]
-
-        ddim_inv = DDIMInversion(self.unet, self.tokenizer, self.text_encoder, self.scheduler, guidance_scale, multiplier, actual_num_frames)
-        ddim_latents = ddim_inv.invert(ddim_latents=latent.unsqueeze(2), prompt_embeds=prompt_embeds, image_embeds=image_embeds)
+        ddim_inv = DDIMInversion(self.unet, self.tokenizer, self.text_encoder, self.scheduler, guidance_scale, multiplier, actual_num_frames, camera)
+        ddim_latents = ddim_inv.invert(ddim_latents=latent, prompt_embeds=prompt_embeds, image_embeds=image_embeds)
         return ddim_latents
     
     def edit(

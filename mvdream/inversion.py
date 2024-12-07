@@ -17,7 +17,6 @@ class DDIMInversion:
 
         self.scheduler.set_timesteps(NUM_DDIM_STEPS)
         self.NUM_DDIM_STEPS = NUM_DDIM_STEPS
-        self.prompt = None
         self.device = next(self.unet.parameters()).device
     
     def next_step(self, model_output: Union[torch.FloatTensor, np.ndarray], timestep: int, sample: Union[torch.FloatTensor, np.ndarray]):
@@ -30,22 +29,14 @@ class DDIMInversion:
         next_sample = alpha_prod_t_next ** 0.5 * next_original_sample + next_sample_direction
         return next_sample
     
-    def get_noise_pred_single(self, latents, t, prompt_embeds, image_embeds):
-        prompt_embeds_neg, prompt_embeds_pos = prompt_embeds
-
+    def get_noise_pred_single(self, latents, t, additional_inputs):
         latent_model_input = torch.cat([latents] * self.multiplier)
         latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
         unet_inputs = {
             'x': latent_model_input,
             'timesteps': torch.tensor([t] * self.actual_num_frames * self.multiplier, dtype=latent_model_input.dtype, device=self.device),
-            'context': torch.cat([prompt_embeds_neg] * self.actual_num_frames + [prompt_embeds_pos] * self.actual_num_frames),
-            'num_frames': self.actual_num_frames,
-            'camera': torch.cat([self.camera] * self.multiplier),
         }
-
-        if image_embeds is not None:
-            unet_inputs['ip'] = image_embeds[0]
-            unet_inputs['ip_img'] = image_embeds[1]
+        unet_inputs.update(additional_inputs)
         
         noise_pred = self.unet.forward(**unet_inputs)
         if self.multiplier > 1:
@@ -81,20 +72,26 @@ class DDIMInversion:
 
     @torch.no_grad()
     def ddim_loop(self, latent, prompt_embeds, image_embeds):
-        all_latent = [latent]
         latent = latent.clone().detach()
+        all_latent = [latent]
         print('DDIM Inversion:')
+        prompt_embeds_neg, prompt_embeds_pos = prompt_embeds
+        additional_inputs = {
+            'context': torch.cat([prompt_embeds_neg] * self.actual_num_frames + [prompt_embeds_pos] * self.actual_num_frames),
+            'num_frames':  self.actual_num_frames,
+            'camera': torch.cat([self.camera] * self.multiplier),
+        }
+        if image_embeds is not None:
+            additional_inputs['ip'] = image_embeds[0]
+            additional_inputs['ip_img'] = image_embeds[1]
+
         for i in tqdm(range(self.NUM_DDIM_STEPS)):
             t = self.scheduler.timesteps[len(self.scheduler.timesteps) - i - 1]
-            noise_pred = self.get_noise_pred_single(latent, t, prompt_embeds, image_embeds)
+            noise_pred = self.get_noise_pred_single(latent, t, additional_inputs)
             latent = self.next_step(noise_pred, t, latent)
             all_latent.append(latent)
 
         return all_latent
-
-    @property
-    def scheduler(self):
-        return self.scheduler
     
     def invert(self, ddim_latents, prompt_embeds, image_embeds):
         # self.init_prompt(prompt, emb_im=emb_im)
