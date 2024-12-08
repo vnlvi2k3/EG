@@ -972,7 +972,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         hs = []
 
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False).to(x.dtype)
-
         emb = self.time_embed(t_emb)
 
         if self.num_classes is not None:
@@ -1005,6 +1004,8 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
             return self.out(h)
         
 class MyMultiViewUNetModel(MultiViewUNetModel):
+
+    
     def forward(
         self,
         x,
@@ -1037,7 +1038,7 @@ class MyMultiViewUNetModel(MultiViewUNetModel):
         hs = []
 
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False).to(x.dtype)
-
+        
         emb = self.time_embed(t_emb)
 
         if self.num_classes is not None:
@@ -1051,7 +1052,8 @@ class MyMultiViewUNetModel(MultiViewUNetModel):
         
         # imagedream variant
         if self.ip_dim > 0:
-            x[(num_frames - 1) :: num_frames, :, :, :] = ip_img # place at [4, 9]
+            x = x.clone()
+            x[(num_frames - 1) :: num_frames, :, :, :] = ip_img
             ip_emb = self.image_embed(ip)
             context = torch.cat((context, ip_emb), 1)
 
