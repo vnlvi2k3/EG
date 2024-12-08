@@ -29,7 +29,7 @@ NUM_DDIM_STEPS = 50
 SIZES = {
     0:4,
     1:2,
-    2:1,
+    2:4,
     3:1,
 }
 bg_remover = rembg.new_session()
@@ -39,6 +39,23 @@ pipe_image = MVDreamPipeline.from_pretrained(
     trust_remote_code=True,
     # local_files_only=True,
 )
+
+def prepare_dump_masks(h, w, scale):
+    precision = torch.float16
+    mask_x0 = torch.rand(5, h, w)
+    dict_mask = {}
+    dict_mask['base'] = mask_x0
+    mask_x0 = (mask_x0>0.5).float().to('cuda', dtype=precision)
+    mask_other = F.interpolate(mask_x0.unsqueeze(1), (int(mask_x0.shape[-2]//scale), int(mask_x0.shape[-1]//scale)))<0.5
+    mask_cur = [
+        torch.zeros(5, int(mask_x0.shape[-2]//scale), int(mask_x0.shape[-1]//scale)).to('cuda', dtype=precision)
+    ]
+    mask_tar = [
+        torch.zeros(5, int(mask_x0.shape[-2]//scale), int(mask_x0.shape[-1]//scale)).to('cuda', dtype=precision)
+    ]
+    return dict_mask, mask_x0, mask_tar, mask_cur, mask_other
+
+
 
 def process(input_image, prompt, prompt_neg='', input_elevation=0, input_num_steps=30, input_seed=42):
 
@@ -64,17 +81,54 @@ def process(input_image, prompt, prompt_neg='', input_elevation=0, input_num_ste
 
     # return mv_image_grid
     latent = pipe_image.image2latent(mv_image)
-    ddim_image = pipe_image.ddim_inv(latent, prompt, image=image, negative_prompt=prompt_neg, guidance_scale=5.0)
+    ddim_latents = pipe_image.ddim_inv(latent, prompt, image=image, negative_prompt=prompt_neg, guidance_scale=5.0)
     temp = []
-    with torch.no_grad():
-        for i in range(len(ddim_image)):
-            image = pipe_image.decode_latents(ddim_image[i])
-            mv_image_grid = np.concatenate([
-                np.concatenate([image[1], image[2]], axis=1),
-                np.concatenate([image[3], image[0]], axis=1),
+    # with torch.no_grad():
+    #     for i in range(len(ddim_latents)):
+    #         image = pipe_image.decode_latents(ddim_latents[i])
+    #         mv_image_grid = np.concatenate([
+    #             np.concatenate([image[1], image[2]], axis=1),
+    #             np.concatenate([image[3], image[0]], axis=1),
+    #         ], axis=0)
+    #         temp.append(mv_image_grid)
+    up_ft_index = [1,2]
+    up_scale = 2
+    scale = 8*SIZES[max(up_ft_index)]/up_scale
+    dict_mask, mask_x0, mask_tar, mask_cur, mask_other = prepare_dump_masks(image.shape[0], image.shape[1], scale)
+    edit_kwargs = {
+        "dict_mask":dict_mask,
+        "mask_x0":mask_x0,
+        "mask_tar":mask_tar,
+        "mask_cur":mask_cur,
+        "mask_other":mask_other,
+        "up_scale":up_scale,
+        "up_ft_index":up_ft_index,
+        "w_edit": 4,
+        "w_inpaint": 0.2,
+        "w_content": 6,
+        "latent_in":ddim_latents[-1],
+    }
+    latent_in = edit_kwargs.pop('latent_in')
+    latent_rec = pipe_image.edit(
+        mode = 'drag',
+        image=image,
+        latent=latent_in, 
+        prompt=prompt, 
+        guidance_scale=5., 
+        energy_scale=2000.0, 
+        latent_noise_ref = ddim_latents,
+        SDE_strength=0.4, 
+        edit_kwargs=edit_kwargs,
+        negative_prompt=prompt_neg,
+    )
+    img_rec = pipe_image.decode_latents(latent_rec)
+    mv_image_grid = np.concatenate([
+                np.concatenate([img_rec[1], img_rec[2]], axis=1),
+                np.concatenate([img_rec[3], img_rec[0]], axis=1),
             ], axis=0)
-            temp.append(mv_image_grid)
-    return temp[20]
+    torch.cuda.empty_cache()
+
+    return mv_image_grid
 
 # class DragonModels():
 #     def __init__(self, pretrained_model_path='ashawkey/mvdream-sd2.1-diffusers'):
