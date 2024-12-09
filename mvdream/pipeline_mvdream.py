@@ -15,7 +15,7 @@ from diffusers.configuration_utils import FrozenDict
 from diffusers.schedulers import DDIMScheduler
 from diffusers.utils.torch_utils import randn_tensor
 import gc
-import tqdm
+from tqdm import tqdm
 import torch.nn as nn
 from mvdream.inversion import DDIMInversion
 from PIL import Image
@@ -79,7 +79,7 @@ class MVDreamPipeline(DiffusionPipeline):
         # params = [param for param in params if hasattr(unet, param.name)]
         # estimator = MyMultiViewUNetModel(**{param.name: getattr(unet, param.name) for param in params})
         # estimator.load_state_dict(unet.state_dict())
-        estimator = MyMultiViewUNetModel.from_config('pretrained/config.json')
+        estimator = MyMultiViewUNetModel.from_config('pretrained/config.json').half()
         estimator.load_state_dict(unet.state_dict(), strict=True)
 
 
@@ -356,7 +356,7 @@ class MVDreamPipeline(DiffusionPipeline):
         image = self.vae.decode(latents).sample
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
-        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        image = image.detach().cpu().permute(0, 2, 3, 1).float().numpy()
         return image
 
     def prepare_extra_step_kwargs(self, generator, eta):
@@ -523,6 +523,10 @@ class MVDreamPipeline(DiffusionPipeline):
         num_frames: int = 4,
         alg='D+'
     ):
+        self.unet = self.unet.to(device='cuda')
+        self.vae = self.vae.to(device='cuda')
+        self.text_encoder = self.text_encoder.to(device='cuda')
+        self.estimator = self.estimator.to(device='cuda')
         print('Start Editing:')
         self.alg=alg
         do_classifier_free_guidance = guidance_scale > 1.0
@@ -574,8 +578,6 @@ class MVDreamPipeline(DiffusionPipeline):
             camera = get_camera(num_frames, elevation=elevation, extra_view=True).to(dtype=latent.dtype, device=self.device)
         else:
             camera = get_camera(num_frames, elevation=elevation, extra_view=False).to(dtype=latent.dtype, device=self.device)
-            ip = torch.cat([image_embeds_neg] * actual_num_frames + [image_embeds_pos] * actual_num_frames)
-            ip_image = torch.cat([image_latents_neg] + [image_latents_pos])
         camera = camera.repeat_interleave(num_images_per_prompt, dim=0) 
         context = torch.cat([prompt_embeds_neg] * actual_num_frames + [prompt_embeds_pos] * actual_num_frames)
         cam = torch.cat([camera] * multiplier)
@@ -585,6 +587,8 @@ class MVDreamPipeline(DiffusionPipeline):
             'camera': cam,
         }
         if image is not None:
+            ip = torch.cat([image_embeds_neg] * actual_num_frames + [image_embeds_pos] * actual_num_frames)
+            ip_image = torch.cat([image_latents_neg] + [image_latents_pos])
             additional_inputs['ip'] = ip
             additional_inputs['ip_img'] = ip_image
         for i, t in enumerate(tqdm(self.scheduler.timesteps[-start_time:])):
@@ -601,7 +605,7 @@ class MVDreamPipeline(DiffusionPipeline):
             stack = []
             for ri in range(repeat):
                 # latent_in = torch.cat([latent.unsqueeze(2)] * 2)
-                tim = torch.tensor([t] * actual_num_frames * multiplier, dtype=latent_model_input.dtype, device=self.device)
+                tim = torch.tensor([t] * actual_num_frames * multiplier, dtype=latent_model_input.dtype, device='cuda')
                 unet_inputs = {
                     'x': latent_model_input,
                     'timesteps': tim,
@@ -609,7 +613,7 @@ class MVDreamPipeline(DiffusionPipeline):
                 unet_inputs.update(additional_inputs)
                 with torch.no_grad():
                     # noise_pred = self.unet(latent_in, t, encoder_hidden_states=context, mask=dict_mask, save_kv=False, mode=mode, iter_cur=i)["sample"].squeeze(2)
-                    noise_pred = self.unet(**unet_inputs)
+                    noise_pred = self.unet.forward(**unet_inputs)
                 noise_pred_uncond, noise_prediction_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
 
@@ -617,7 +621,12 @@ class MVDreamPipeline(DiffusionPipeline):
                     # editing guidance
                     noise_pred_org = noise_pred
                     if mode == 'drag':
-                        guidance = self.guidance_drag(latent=latent, latent_noise_ref=latent_noise_ref[-(i+1)], t=tim, energy_scale=energy_scale, additional_inputs= additional_inputs, **edit_kwargs)
+                        latent_noise_ref_input = latent_noise_ref[-(i+1)]
+                        latent_noise_ref_input = torch.cat([latent_noise_ref_input] * multiplier)
+                        latent_noise_ref_input = self.scheduler.scale_model_input(latent_noise_ref_input, t)
+
+                        guidance = self.guidance_drag(latent=latent_model_input, latent_noise_ref=latent_noise_ref_input, t=tim, energy_scale=energy_scale, additional_inputs= additional_inputs, **edit_kwargs)
+                    _, guidance = guidance.chunk(2)
                     noise_pred = noise_pred + guidance
                 else:
                     noise_pred_org=None
@@ -653,7 +662,7 @@ class MVDreamPipeline(DiffusionPipeline):
                     variance = std_dev_t * variance_noise
                     
                     if mode == 'drag':
-                        mask = F.interpolate(edit_kwargs["mask_x0"][None,None], (latent_prev[-1].shape[-2], latent_prev[-1].shape[-1]))
+                        mask = F.interpolate(edit_kwargs["mask_x0"].unsqueeze(1), (latent_prev[-1].shape[-2], latent_prev[-1].shape[-1]))
                         mask = (mask>0).to(dtype=latent.dtype)
                 if repeat>1:
                     with torch.no_grad():
@@ -662,13 +671,15 @@ class MVDreamPipeline(DiffusionPipeline):
                         beta_prod_t = 1 - alpha_prod_t
 
                         next_tim = torch.tensor([next_timestep] * actual_num_frames * multiplier, dtype=latent_model_input.dtype, device=self.device)
+                        latent_prev_input = torch.cat([latent_prev] * multiplier)
+                        latent_prev_input = self.scheduler.scale_model_input(latent_prev_input, t)
                         unet_inputs = {
-                            'x': latent_prev,
+                            'x': latent_prev_input,
                             'timesteps': next_tim,
                         }
-                        additional_inputs.update(additional_inputs)
-
-                        model_output = self.unet(**unet_inputs)
+                        unet_inputs.update(additional_inputs)
+                        model_output = self.unet.forward(**unet_inputs)
+                        _, model_output = model_output.chunk(2)
                         next_original_sample = (latent_prev - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
                         next_sample_direction = (1 - alpha_prod_t_next) ** 0.5 * model_output
                         latent = alpha_prod_t_next ** 0.5 * next_original_sample + next_sample_direction
@@ -695,36 +706,30 @@ class MVDreamPipeline(DiffusionPipeline):
         additional_inputs,
         dict_mask = None,
     ):
+        mask_x0 = torch.cat([mask_x0] * 2)
+        mask_other = torch.cat([mask_other] * 2)
         cos = nn.CosineSimilarity(dim=1)
         ref_inputs = {
             'x': latent_noise_ref,
-            'time_step': t,
+            'timesteps': t,
             'up_ft_indices': up_ft_index,
         }
         ref_inputs.update(additional_inputs)
         with torch.no_grad():
-            # up_ft_tar = self.estimator(
-            #             sample=latent_noise_ref.squeeze(2),
-            #             timestep=t,
-            #             up_ft_indices=up_ft_index,
-            #             encoder_hidden_states=text_embeddings)['up_ft']
-            up_ft_tar = self.unet(**ref_inputs)['up_ft']
+            ref_inputs['ip_img'] = ref_inputs['ip_img'].detach().clone().requires_grad_(False)
+            ref_inputs['ip'] = ref_inputs['ip'].detach().clone().requires_grad_(False)
+            up_ft_tar = self.estimator.forward(**ref_inputs)['up_ft']
             for f_id in range(len(up_ft_tar)):
                 up_ft_tar[f_id] = F.interpolate(up_ft_tar[f_id], (up_ft_tar[-1].shape[-2]*up_scale, up_ft_tar[-1].shape[-1]*up_scale))
 
         latent = latent.detach().requires_grad_(True)
         cur_inputs = {
             'x': latent,
-            'time_step': t,
+            'timesteps': t,
             'up_ft_indices': up_ft_index,
         }
         cur_inputs.update(additional_inputs)
-        # up_ft_cur = self.estimator(
-        #             sample=latent,
-        #             timestep=t,
-        #             up_ft_indices=up_ft_index,
-        #             encoder_hidden_states=text_embeddings)['up_ft']
-        up_ft_cur = self.unet(**cur_inputs)['up_ft']
+        up_ft_cur = self.estimator.forward(**cur_inputs)['up_ft']
         for f_id in range(len(up_ft_cur)):
             up_ft_cur[f_id] = F.interpolate(up_ft_cur[f_id], (up_ft_cur[-1].shape[-2]*up_scale, up_ft_cur[-1].shape[-1]*up_scale))
 
@@ -732,6 +737,8 @@ class MVDreamPipeline(DiffusionPipeline):
         loss_edit = 0
         for f_id in range(len(up_ft_tar)):
             for mask_cur_i, mask_tar_i in zip(mask_cur, mask_tar):
+                mask_cur_i = torch.cat([mask_cur_i] * 2).unsqueeze(1).bool()
+                mask_tar_i = torch.cat([mask_tar_i] * 2).unsqueeze(1).bool()
                 up_ft_cur_vec = up_ft_cur[f_id][mask_cur_i.repeat(1,up_ft_cur[f_id].shape[1],1,1)].view(up_ft_cur[f_id].shape[1], -1).permute(1,0)
                 up_ft_tar_vec = up_ft_tar[f_id][mask_tar_i.repeat(1,up_ft_tar[f_id].shape[1],1,1)].view(up_ft_tar[f_id].shape[1], -1).permute(1,0)
                 sim = (cos(up_ft_cur_vec, up_ft_tar_vec)+1.)/2.
@@ -746,14 +753,15 @@ class MVDreamPipeline(DiffusionPipeline):
         # consistency loss
         loss_con = 0
         for f_id in range(len(up_ft_tar)):
-            sim_other = (cos(up_ft_tar[f_id], up_ft_cur[f_id])[0][mask_other[0,0]]+1.)/2.
+            sim_other = (cos(up_ft_tar[f_id], up_ft_cur[f_id])[mask_other.squeeze(1)]+1.)/2.
             loss_con = loss_con+w_content/(1+4*sim_other.mean())
         loss_edit = loss_edit/len(up_ft_cur)/len(mask_cur)
         loss_con = loss_con/len(up_ft_cur)
 
+        
         cond_grad_edit = torch.autograd.grad(loss_edit*energy_scale, latent, retain_graph=True)[0]
         cond_grad_con = torch.autograd.grad(loss_con*energy_scale, latent)[0]
-        mask = F.interpolate(mask_x0[None,None], (cond_grad_edit[-1].shape[-2], cond_grad_edit[-1].shape[-1]))
+        mask = F.interpolate(mask_x0.unsqueeze(1), (cond_grad_edit[-1].shape[-2], cond_grad_edit[-1].shape[-1]))
         mask = (mask>0).to(dtype=latent.dtype)
         guidance = cond_grad_edit.detach()*4e-2*mask + cond_grad_con.detach()*4e-2*(1-mask)
         self.estimator.zero_grad()
